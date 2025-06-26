@@ -4,171 +4,123 @@ import { createClient } from '@supabase/supabase-js'
 import { onMounted, ref, reactive, watch } from 'vue'
 import draggable from 'vuedraggable'
 
-const config = useRuntimeConfig()
-const supabase = createClient(config.public.supabaseUrl, config.public.supabaseAnonKey)
+/* ──────────────────  Supabase  ────────────────── */
+const cfg = useRuntimeConfig()
+const supabase = createClient(cfg.public.supabaseUrl, cfg.public.supabaseAnonKey)
 
+/* ──────────────────  State  ────────────────── */
 const groups = ref([])
-const selectedGroupId = ref(null)
-const selectedGroup = ref(null)
-const rounds = reactive([])
 const pacePresets = ref([])
-
+const rounds = reactive([])
+const selectedGroupId = ref(null)
 const router = useRouter()
 
+/* ──────────────────  Lifecycle  ────────────────── */
 onMounted(async () => {
-    await fetchGroups()
+    const { data: g } = await supabase.from('groups').select('*')
+    const { data: pp } = await supabase.from('pace_presets').select('*')
+    groups.value = g
+    pacePresets.value = pp
+    if (g.length) selectedGroupId.value = g[0].id
 })
-
-async function fetchGroups() {
-    const { data: groupData } = await supabase.from('groups').select('*')
-    const { data: presetData } = await supabase.from('pace_presets').select('*')
-    groups.value = groupData
-    pacePresets.value = presetData
-    if (groupData.length > 0) {
-        selectedGroupId.value = groupData[0].id
-    }
-}
 
 watch(selectedGroupId, async () => {
-    selectedGroup.value = groups.value.find(g => g.id === selectedGroupId.value)
-    rounds.splice(0, rounds.length)
-    await fetchRoundsForGroup()
-})
-
-async function fetchRoundsForGroup() {
-    if (!selectedGroupId.value) return
-
-    const { data: savedRounds } = await supabase
+    rounds.splice(0)           // reset
+    const { data } = await supabase
         .from('rounds')
         .select('*')
         .eq('group_id', selectedGroupId.value)
-        .order('position', { ascending: true })
+        .order('position')
+    data.forEach(r => rounds.push(mapDBRound(r)))
+})
 
-    rounds.splice(0, rounds.length, ...savedRounds.map(r => ({
-        preset: detectPreset(r.pace_s),
-        customPace: secondsToParts(r.pace_s)
-    })))
-}
+/* ──────────────────  Helpers  ────────────────── */
+const mapDBRound = r => ({
+    preset: detectPreset(r.pace_s),
+    customPace: secToMinSec(r.pace_s)
+})
 
-function detectPreset(pace_s) {
-    const match = pacePresets.value.find(p =>
-        p.group_id === selectedGroupId.value && p.pace_s === pace_s
-    )
-    return match?.pace_type ?? 'custom'
-}
+const detectPreset = s =>
+    pacePresets.value.find(p => p.group_id === selectedGroupId.value && p.pace_s === s)?.pace_type ?? 'custom'
 
-function secondsToParts(s) {
-    const sec = s % 60
-    const min = Math.floor(s / 60)
-    return { min, sec }
-}
+const secToMinSec = s => ({ min: Math.floor(s / 60), sec: s % 60 })
+const minSecToSec = obj => Number(obj.min) * 60 + Number(obj.sec)
 
-function paceToSeconds(pace) {
-    const m = Number(pace.min)
-    const s = Number(pace.sec)
-    return isNaN(m) || isNaN(s) ? null : m * 60 + s
-}
+/* ──────────────────  Round CRUD  ────────────────── */
+const addRound = () => rounds.push({ preset: 'custom', customPace: { min: 0, sec: 0 } })
+const deleteRound = i => rounds.splice(i, 1)
 
-function addRound() {
-    rounds.push({
-        preset: 'custom',
-        customPace: { min: 0, sec: 0 }
-    })
-}
-
-function deleteRound(index) {
-    rounds.splice(index, 1)
-}
-
-function getPresetPace(presetType) {
-    const preset = pacePresets.value.find(
-        p => p.group_id === selectedGroupId.value && p.pace_type === presetType
-    )
-    return preset?.pace_s ?? null
-}
+const presetToSec = type =>
+    pacePresets.value.find(p => p.group_id === selectedGroupId.value && p.pace_type === type)?.pace_s ?? null
 
 async function saveRounds() {
     if (!selectedGroupId.value) return
     await supabase.from('rounds').delete().eq('group_id', selectedGroupId.value)
 
-    for (const [i, round] of rounds.entries()) {
-        let pace_s = null
-        if (round.preset !== 'custom') {
-            pace_s = getPresetPace(round.preset)
-        } else {
-            pace_s = paceToSeconds(round.customPace)
-        }
-
-        if (pace_s === null) continue
-
-        await supabase.from('rounds').insert([{
-            group_id: selectedGroupId.value,
-            position: i,
-            pace_s
-        }])
+    for (const [i, r] of rounds.entries()) {
+        const pace_s = r.preset === 'custom' ? minSecToSec(r.customPace) : presetToSec(r.preset)
+        if (!pace_s) continue
+        await supabase.from('rounds').insert([{ group_id: selectedGroupId.value, position: i, pace_s }])
     }
-
     alert('✅ Runden gespeichert')
 }
 
-function goToTracking() {
-    router.push(`/tracking?group=${selectedGroupId.value}`)
-}
+const goToTracking = () => router.push(`/tracking?group=${selectedGroupId.value}`)
 </script>
 
 <template>
-    <div class="max-w-xl mx-auto p-4 space-y-4">
-        <h2 class="text-xl font-bold mb-4">Rundenplanung</h2>
+    <div class="max-w-lg mx-auto flex flex-col gap-6 p-4">
+        <!-- Header -->
+        <h1 class="text-2xl font-bold text-center">Rundenplanung</h1>
 
-        <label class="block mb-1 text-sm font-medium">Gruppe wählen:</label>
-        <select v-model="selectedGroupId" class="w-full border p-2 rounded text-sm mb-4">
+        <!-- Gruppenwahl -->
+        <select v-model="selectedGroupId"
+            class="w-full rounded border px-3 py-2 text-base focus:ring-2 focus:ring-purple-500">
             <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
         </select>
 
-        <draggable v-model="rounds" item-key="index" class="space-y-2" handle=".handle">
-            <template #item="{ element, index }">
-                <div class="p-3 border rounded bg-white shadow-sm flex flex-col gap-2">
-                    <div class="flex justify-between items-center">
-                        <strong>Runde {{ index + 1 }}</strong>
-                        <span class="cursor-move handle text-gray-400">↕</span>
+        <!-- Rundenliste (drag) -->
+        <draggable v-model="rounds" handle=".drag" item-key="index" class="flex flex-col gap-3">
+            <template #item="{ element: r, index: i }">
+                <div class="rounded-lg bg-white shadow p-3">
+                    <!-- Head -->
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="font-semibold">Runde {{ i + 1 }}</span>
+                        <span class="drag cursor-grab text-gray-400 text-lg">⋮⋮</span>
                     </div>
 
-                    <div class="flex gap-2 items-center text-sm">
-                        <label>Tempo:</label>
-                        <select v-model="element.preset" class="border rounded p-1 text-sm">
+                    <!-- Pace Row -->
+                    <div class="flex flex-wrap gap-2 items-center text-sm">
+                        <select v-model="r.preset" class="border rounded px-1 py-0.5">
                             <option value="langsam">Langsam</option>
                             <option value="mittel">Mittel</option>
                             <option value="schnell">Schnell</option>
-                            <option value="custom">Eigene Pace</option>
+                            <option value="custom">Custom</option>
                         </select>
 
-                        <template v-if="element.preset === 'custom'">
-                            <select v-model.number="element.customPace.min" class="border rounded p-1">
-                                <option v-for="m in 10" :key="m" :value="m">{{ m }} min</option>
-                            </select>
-                            <select v-model.number="element.customPace.sec" class="border rounded p-1">
-                                <option v-for="s in [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]" :key="s" :value="s">{{ s }} sek
-                                </option>
-                            </select>
+                        <template v-if="r.preset === 'custom'">
+                            <input v-model.number="r.customPace.min" type="number" min="0" max="10"
+                                class="w-14 border rounded px-1 py-0.5 text-center" />min
+                            <input v-model.number="r.customPace.sec" type="number" min="0" max="59"
+                                class="w-14 border rounded px-1 py-0.5 text-center" />s
                         </template>
                     </div>
 
-                    <button @click="deleteRound(index)" class="text-red-500 text-sm mt-1 self-end">🗑️ Löschen</button>
+                    <!-- Delete -->
+                    <button @click="deleteRound(i)" class="mt-2 text-red-500 text-sm inline-flex items-center gap-1">
+                        <span class="i-heroicons-trash-20-solid"></span> Löschen
+                    </button>
                 </div>
             </template>
         </draggable>
 
-        <button @click="addRound" class="w-full bg-green-600 text-white py-2 rounded hover:bg-green-500">
-            ➕ Runde hinzufügen
-        </button>
-
-        <button @click="saveRounds" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-500">
-            💾 Runden speichern
-        </button>
-
-        <button v-if="rounds.length > 0" @click="goToTracking"
-            class="w-full bg-purple-600 text-white py-2 rounded hover:bg-purple-500">
-            ▶ Weiter zum Tracking
-        </button>
+        <!-- Action Buttons -->
+        <div class="flex flex-col gap-3">
+            <button @click="addRound" class="btn w-full bg-green-600 hover:bg-green-500">➕ Runde hinzufügen</button>
+            <button @click="saveRounds" class="btn w-full bg-blue-600 hover:bg-blue-500">💾 Runden speichern</button>
+            <button v-if="rounds.length" @click="goToTracking" class="btn w-full bg-purple-600 hover:bg-purple-500">▶
+                Tracking
+                starten</button>
+        </div>
     </div>
 </template>
